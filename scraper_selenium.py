@@ -12,6 +12,8 @@ import re
 import time
 from urllib.parse import urljoin
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 
 class PartstownScraperSelenium:
@@ -25,8 +27,8 @@ class PartstownScraperSelenium:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
         
-    def init_driver(self):
-        """Initialize Selenium WebDriver"""
+    def _create_driver(self):
+        """Create a new Selenium WebDriver instance (for parallel processing)"""
         chrome_options = Options()
         # Comment out headless for debugging - we can enable it after testing
         # chrome_options.add_argument('--headless')  # Run in background
@@ -39,35 +41,33 @@ class PartstownScraperSelenium:
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         
         # Try to find Chrome or Brave browser
-        import os
-        
         # Try Chrome first (preferred)
         chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         brave_path = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
         
         if os.path.exists(chrome_path):
-            print("Found Google Chrome, using it")
             chrome_options.binary_location = chrome_path
         elif os.path.exists(brave_path):
-            print("Found Brave Browser, using it instead of Chrome")
             chrome_options.binary_location = brave_path
         
         try:
             # Use webdriver-manager to automatically download and manage chromedriver
             service = Service(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            driver = webdriver.Chrome(service=service, options=chrome_options)
             # Execute script to hide webdriver property
-            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
                 'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'
             })
-            print("Selenium WebDriver initialized successfully")
+            return driver
         except Exception as e:
             print(f"Error initializing Chrome driver: {e}")
-            print("\nBrowser installation required!")
-            print("Install Chrome: brew install --cask google-chrome")
-            print("Or download: https://www.google.com/chrome/")
-            print("\nSee SETUP_BROWSER.md for more options")
             raise
+    
+    def init_driver(self):
+        """Initialize Selenium WebDriver"""
+        driver = self._create_driver()
+        self.driver = driver
+        print("Selenium WebDriver initialized successfully")
     
     def sanitize_filename(self, filename):
         """Remove invalid characters from filename"""
@@ -75,8 +75,9 @@ class PartstownScraperSelenium:
         filename = filename.strip()
         return filename[:100]
     
-    def handle_popups(self):
+    def handle_popups(self, driver=None):
         """Handle country selection, cookie consent, and other popups"""
+        driver_to_use = driver if driver is not None else self.driver
         try:
             print("Handling popups and modals...")
             
@@ -86,11 +87,11 @@ class PartstownScraperSelenium:
             # Handle Country & Currency popup
             try:
                 # Look for the country selection button
-                start_shopping_buttons = self.driver.find_elements(By.XPATH, 
+                start_shopping_buttons = driver_to_use.find_elements(By.XPATH, 
                     "//button[contains(text(), 'START SHOPPING') or contains(text(), 'Start Shopping')]")
                 if not start_shopping_buttons:
                     # Try finding button by different methods
-                    start_shopping_buttons = self.driver.find_elements(By.XPATH,
+                    start_shopping_buttons = driver_to_use.find_elements(By.XPATH,
                         "//a[contains(text(), 'START SHOPPING')]")
                 
                 for button in start_shopping_buttons:
@@ -105,7 +106,7 @@ class PartstownScraperSelenium:
             # Handle cookie consent
             try:
                 # Look for cookie consent buttons
-                cookie_buttons = self.driver.find_elements(By.XPATH,
+                cookie_buttons = driver_to_use.find_elements(By.XPATH,
                     "//button[contains(text(), 'Accept') or contains(text(), 'Accept All') or contains(text(), 'Ok')]")
                 
                 for button in cookie_buttons:
@@ -120,7 +121,7 @@ class PartstownScraperSelenium:
             # Close any notifications if they appear
             try:
                 # Look for notification close buttons
-                close_buttons = self.driver.find_elements(By.XPATH,
+                close_buttons = driver_to_use.find_elements(By.XPATH,
                     "//button[@aria-label='Close' or contains(@class, 'close') or contains(@class, 'notification-close')]")
                 
                 for button in close_buttons:
@@ -136,12 +137,13 @@ class PartstownScraperSelenium:
         except Exception as e:
             print(f"Error handling popups: {e}")
     
-    def get_page_selenium(self, url, wait_time=10):
+    def get_page_selenium(self, url, wait_time=10, driver=None):
         """Load a page with Selenium and wait for content"""
+        driver_to_use = driver if driver is not None else self.driver
         try:
-            self.driver.get(url)
+            driver_to_use.get(url)
             time.sleep(3)  # Give time for JavaScript to load
-            self.handle_popups()  # Handle any popups that appear
+            self.handle_popups(driver=driver_to_use)  # Handle any popups that appear
             return True
         except Exception as e:
             print(f"Error loading page {url}: {e}")
@@ -244,11 +246,12 @@ class PartstownScraperSelenium:
         print(f"\nTotal: Found {len(unique_parts)} unique parts across {page_num + 1} page(s)")
         return unique_parts
     
-    def get_part_details(self, part_url):
+    def get_part_details(self, part_url, driver=None):
         """Fetch detailed information about a specific part using Selenium"""
+        driver_to_use = driver if driver is not None else self.driver
         print(f"Fetching details from: {part_url}")
         
-        if not self.get_page_selenium(part_url, wait_time=15):
+        if not self.get_page_selenium(part_url, wait_time=15, driver=driver_to_use):
             return None, [], part_url
         
         details = {}
@@ -257,7 +260,7 @@ class PartstownScraperSelenium:
         
         # Wait for product info section to load
         try:
-            WebDriverWait(self.driver, 10).until(
+            WebDriverWait(driver_to_use, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".product-info, .product-block"))
             )
         except TimeoutException:
@@ -277,7 +280,7 @@ class PartstownScraperSelenium:
         
         # Method 1: Use product__row structure (primary method)
         try:
-            rows = self.driver.find_elements(By.CSS_SELECTOR, ".product-info .product__row")
+            rows = driver_to_use.find_elements(By.CSS_SELECTOR, ".product-info .product__row")
             for row in rows:
                 try:
                     label_elem = row.find_element(By.CSS_SELECTOR, ".product__label")
@@ -320,7 +323,7 @@ class PartstownScraperSelenium:
         # Get List Price (special handling)
         try:
             # Try data attribute first - most reliable
-            price_elem = self.driver.find_element(By.CSS_SELECTOR, "[data-listprice]")
+            price_elem = driver_to_use.find_element(By.CSS_SELECTOR, "[data-listprice]")
             data_price = price_elem.get_attribute('data-listprice')
             if data_price:
                 # Format as currency
@@ -337,7 +340,7 @@ class PartstownScraperSelenium:
         except:
             try:
                 # Alternative: Look for price element with "List Price" label
-                price_row = self.driver.find_element(By.XPATH,
+                price_row = driver_to_use.find_element(By.XPATH,
                     "//div[contains(@class, 'product__row')]//div[contains(@class, 'product__label') and contains(text(), 'List Price')]/following-sibling::div[@class='product__cell product__val']")
                 price_text = price_row.text.strip()
                 if price_text:
@@ -345,7 +348,7 @@ class PartstownScraperSelenium:
             except:
                 try:
                     # Last resort: Look for any price element
-                    price_elem = self.driver.find_element(By.CSS_SELECTOR, ".js-product-listPrice, .price-vat")
+                    price_elem = driver_to_use.find_element(By.CSS_SELECTOR, ".js-product-listPrice, .price-vat")
                     price_text = price_elem.text.strip()
                     # Only use if it doesn't say "My Price"
                     if price_text and '$' in price_text and 'My Price' not in price_text:
@@ -355,7 +358,7 @@ class PartstownScraperSelenium:
         
         # Get California Residents warning
         try:
-            cal_elem = self.driver.find_element(By.XPATH, 
+            cal_elem = driver_to_use.find_element(By.XPATH, 
                 "//*[contains(text(), 'California Residents') or contains(text(), 'Prop 65')]")
             if cal_elem:
                 parent = cal_elem.find_element(By.XPATH, "./..")
@@ -394,7 +397,7 @@ class PartstownScraperSelenium:
         try:
             # Step 1: Extract PDFs from data attributes FIRST (most reliable, works even without clicking)
             try:
-                pdf_data_elems = self.driver.find_elements(By.XPATH, "//*[@data-manual-name]")
+                pdf_data_elems = driver_to_use.find_elements(By.XPATH, "//*[@data-manual-name]")
                 for elem in pdf_data_elems:
                     try:
                         # First try to get href (most reliable)
@@ -415,7 +418,7 @@ class PartstownScraperSelenium:
             
             # Step 2: Find PDFs on main page (direct links)
             try:
-                pdf_links = self.driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
+                pdf_links = driver_to_use.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
                 for link in pdf_links:
                     try:
                         href = link.get_attribute('href')
@@ -428,18 +431,18 @@ class PartstownScraperSelenium:
             
             # Step 3: Click "MANUALS & DIAGRAMS" tab to reveal more PDFs
             try:
-                manual_tab = self.driver.find_element(By.XPATH,
+                manual_tab = driver_to_use.find_element(By.XPATH,
                     "//a[@href='#manualsDiagrams'] | //a[contains(@href, '#manualsDiagrams')] | " +
                     "//li[@role='tab']//a[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'manuals') and contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'diagrams')]")
                 
                 if manual_tab and manual_tab.is_displayed():
-                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", manual_tab)
+                    driver_to_use.execute_script("arguments[0].scrollIntoView({block: 'center'});", manual_tab)
                     time.sleep(0.5)
                     manual_tab.click()
                     time.sleep(4)  # Wait for content to load
                     
                     # Find all PDFs after clicking tab
-                    tab_pdfs = self.driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
+                    tab_pdfs = driver_to_use.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
                     for link in tab_pdfs:
                         try:
                             href = link.get_attribute('href')
@@ -450,7 +453,7 @@ class PartstownScraperSelenium:
                     
                     # Also extract from data attributes again after tab click (in case new content loaded)
                     try:
-                        pdf_data_elems_after = self.driver.find_elements(By.XPATH, "//*[@data-manual-name]")
+                        pdf_data_elems_after = driver_to_use.find_elements(By.XPATH, "//*[@data-manual-name]")
                         for elem in pdf_data_elems_after:
                             try:
                                 href = elem.get_attribute('href')
@@ -466,11 +469,11 @@ class PartstownScraperSelenium:
                     
                     # Scroll within the tab section to trigger lazy loading
                     try:
-                        section = self.driver.find_element(By.XPATH,
+                        section = driver_to_use.find_element(By.XPATH,
                             "//div[@id='manualsDiagrams'] | //div[contains(@class, 'manuals')] | //section[@id='manualsDiagrams']")
                         if section:
                             for i in range(3):
-                                self.driver.execute_script("arguments[0].scrollTop += 300;", section)
+                                driver_to_use.execute_script("arguments[0].scrollTop += 300;", section)
                                 time.sleep(1)
                                 
                                 # Check for new PDFs after scroll
@@ -489,7 +492,7 @@ class PartstownScraperSelenium:
             
             # Step 4: Check popup menus (model-specific manuals)
             try:
-                popup_items = self.driver.find_elements(By.XPATH,
+                popup_items = driver_to_use.find_elements(By.XPATH,
                     "//ul[contains(@class, 'data-sheet__popup__list')]//a | " +
                     "//div[contains(@class, 'popup')]//a[contains(@href, '.pdf')] | " +
                     "//div[contains(@class, 'data-sheet__popup')]//a")
@@ -511,10 +514,10 @@ class PartstownScraperSelenium:
             
             # Step 5: Scroll entire page to catch any lazy-loaded PDFs
             for i in range(3):
-                self.driver.execute_script("window.scrollBy(0, 500);")
+                driver_to_use.execute_script("window.scrollBy(0, 500);")
                 time.sleep(1)
                 
-                scroll_pdfs = self.driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
+                scroll_pdfs = driver_to_use.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
                 for link in scroll_pdfs:
                     try:
                         href = link.get_attribute('href')
@@ -550,10 +553,11 @@ class PartstownScraperSelenium:
         
         return details, pdf_urls, product_page_url
     
-    def download_pdf(self, pdf_url, filepath):
+    def download_pdf(self, pdf_url, filepath, session=None):
         """Download a PDF file"""
+        session_to_use = session if session is not None else self.session
         try:
-            response = self.session.get(pdf_url, timeout=60, stream=True)
+            response = session_to_use.get(pdf_url, timeout=60, stream=True)
             response.raise_for_status()
             
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -613,13 +617,13 @@ class PartstownScraperSelenium:
             f.write('\n'.join(content))
         print(f"Saved info: {os.path.basename(filepath)}")
     
-    def scrape_part(self, part):
+    def scrape_part(self, part, driver=None, session=None):
         """Scrape a single part"""
         part_name = self.sanitize_filename(part['name'])
         part_folder = os.path.join(self.output_dir, part_name)
         
         # Get part details
-        details, pdf_urls, product_page_url = self.get_part_details(part['url'])
+        details, pdf_urls, product_page_url = self.get_part_details(part['url'], driver=driver)
         
         if details:
             # Save product information with product page link and PDF links
@@ -628,39 +632,97 @@ class PartstownScraperSelenium:
         
         # Download PDFs
         pdf_count = 0
+        session_to_use = session if session is not None else self.session
         for idx, pdf_url in enumerate(pdf_urls):
             pdf_filename = f"manual_{idx + 1}.pdf"
             pdf_path = os.path.join(part_folder, pdf_filename)
-            if self.download_pdf(pdf_url, pdf_path):
+            if self.download_pdf(pdf_url, pdf_path, session=session_to_use):
                 pdf_count += 1
         
         print(f"Scraped: {part_name} ({pdf_count} PDFs downloaded)")
         time.sleep(2)  # Be respectful
     
-    def run(self, url):
-        """Main scraping function"""
+    def _scrape_part_worker(self, part, part_index, total_parts):
+        """Worker function for parallel processing - creates its own driver instance"""
+        driver = None
+        session = None
+        try:
+            print(f"\n[Thread {threading.current_thread().name}] Processing part {part_index}/{total_parts}")
+            # Create a new driver instance for this thread
+            driver = self._create_driver()
+            # Create a new session for this thread (for thread-safe PDF downloads)
+            session = requests.Session()
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            })
+            # Scrape the part using this driver and session
+            self.scrape_part(part, driver=driver, session=session)
+            return True
+        except Exception as e:
+            print(f"Error processing part {part.get('name', 'Unknown')}: {e}")
+            return False
+        finally:
+            # Clean up driver
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+            # Session cleanup is automatic, but we can close it explicitly
+            if session:
+                try:
+                    session.close()
+                except:
+                    pass
+    
+    def run(self, url, max_workers=3):
+        """Main scraping function with parallel processing"""
         print("Starting Partstown Trane Parts Scraper (Selenium)")
+        print("=" * 50)
+        print(f"Parallel processing enabled with {max_workers} workers")
         print("=" * 50)
         
         try:
-            # Initialize driver
+            # Initialize driver (only needed for extracting parts list)
             self.init_driver()
             
             # Create output directory
             os.makedirs(self.output_dir, exist_ok=True)
             
-            # Get all parts
+            # Get all parts (still sequential - only one page)
             parts = self.extract_trane_parts(url)
             
             if not parts:
                 print("No parts found. The page might need authentication or has a different structure.")
                 return
             
-            # Scrape each part
+            # Close the main driver since we'll create new ones for parallel processing
+            if self.driver:
+                self.driver.quit()
+                self.driver = None
+            
+            # Process parts in parallel
             total = len(parts)
-            for idx, part in enumerate(parts, 1):
-                print(f"\nProcessing part {idx}/{total}")
-                self.scrape_part(part)
+            print(f"\nProcessing {total} parts in parallel with {max_workers} workers...")
+            
+            # Use ThreadPoolExecutor for parallel processing
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                futures = []
+                for idx, part in enumerate(parts, 1):
+                    future = executor.submit(self._scrape_part_worker, part, idx, total)
+                    futures.append(future)
+                
+                # Wait for all tasks to complete and track progress
+                completed = 0
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                        completed += 1
+                        print(f"\nProgress: {completed}/{total} parts completed")
+                    except Exception as e:
+                        print(f"\nError in parallel processing: {e}")
+                        completed += 1
             
             print("\n" + "=" * 50)
             print(f"Scraping complete! {total} parts processed.")
